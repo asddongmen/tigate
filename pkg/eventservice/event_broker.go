@@ -36,6 +36,7 @@ var metricEventBrokerScanTaskCount = metrics.EventServiceScanTaskCount
 var metricScanTaskQueueDuration = metrics.EventServiceScanTaskQueueDuration
 var metricEventBrokerTaskHandleDuration = metrics.EventServiceTaskHandleDuration
 var metricEventBrokerPendingScanTaskCount = metrics.EventServicePendingScanTaskCount
+var metricEventBrokerDropResolvedTsEventCount = metrics.EventServiceDropResolvedTsEventCount
 
 // eventBroker get event from the eventStore, and send the event to the dispatchers.
 // Every TiDB cluster has a eventBroker.
@@ -166,17 +167,17 @@ func (c *eventBroker) sendWatermark(
 		server,
 		re,
 		d.getEventSenderState())
-	c.getMessageCh(d.workerIndex) <- resolvedEvent
+	// c.getMessageCh(d.workerIndex) <- resolvedEvent
 	// We comment out the following code is because we found when some resolvedTs are dropped,
 	// the lag of the resolvedTs will increase.
-	// select {
-	// case c.getMessageCh(d.workerIndex) <- resolvedEvent:
-	// 	if counter != nil {
-	// 		counter.Inc()
-	// 	}
-	// default:
-	// 	metricEventBrokerDropResolvedTsCount.Inc()
-	// }
+	select {
+	case c.getMessageCh(d.workerIndex) <- resolvedEvent:
+		if counter != nil {
+			counter.Inc()
+		}
+	default:
+		metricEventBrokerDropResolvedTsEventCount.Inc()
+	}
 }
 
 func (c *eventBroker) sendReadyEvent(
