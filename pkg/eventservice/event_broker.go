@@ -17,6 +17,7 @@ import (
 	"github.com/pingcap/ticdc/pkg/messaging"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/node"
+	"github.com/pingcap/ticdc/utils/chann"
 	"github.com/pingcap/ticdc/utils/dynstream"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tikv/client-go/v2/oracle"
@@ -65,7 +66,7 @@ type eventBroker struct {
 
 	// messageCh is used to receive message from the scanWorker,
 	// and a goroutine is responsible for sending the message to the dispatchers.
-	messageCh []chan *wrapEvent
+	messageCh []*chann.Chann[*wrapEvent]
 
 	// wg is used to spawn the goroutines.
 	wg *sync.WaitGroup
@@ -117,7 +118,7 @@ func newEventBroker(
 		msgSender:               mc,
 		taskQueue:               make(chan scanTask, conf.ScanTaskQueueSize),
 		scanWorkerCount:         defaultScanWorkerCount,
-		messageCh:               make([]chan *wrapEvent, messageWorkerCount),
+		messageCh:               make([]*chann.Chann[*wrapEvent], messageWorkerCount),
 		cancel:                  cancel,
 		wg:                      wg,
 
@@ -141,7 +142,7 @@ func newEventBroker(
 	}
 
 	for i := 0; i < messageWorkerCount; i++ {
-		c.messageCh[i] = make(chan *wrapEvent, defaultChannelSize*4)
+		c.messageCh[i] = chann.New[*wrapEvent]()
 	}
 
 	c.runScanWorker(ctx)
@@ -167,17 +168,20 @@ func (c *eventBroker) sendWatermark(
 		server,
 		re,
 		d.getEventSenderState())
-	// c.getMessageCh(d.workerIndex) <- resolvedEvent
+	c.getMessageCh(d.workerIndex).In() <- resolvedEvent
+	if counter != nil {
+		counter.Inc()
+	}
 	// We comment out the following code is because we found when some resolvedTs are dropped,
 	// the lag of the resolvedTs will increase.
-	select {
-	case c.getMessageCh(d.workerIndex) <- resolvedEvent:
-		if counter != nil {
-			counter.Inc()
-		}
-	default:
-		metricEventBrokerDropResolvedTsEventCount.Inc()
-	}
+	// select {
+	// case c.getMessageCh(d.workerIndex) <- resolvedEvent:
+	// 	if counter != nil {
+	// 		counter.Inc()
+	// 	}
+	// default:
+	// 	metricEventBrokerDropResolvedTsEventCount.Inc()
+	// }
 }
 
 func (c *eventBroker) sendReadyEvent(
@@ -187,7 +191,7 @@ func (c *eventBroker) sendReadyEvent(
 	event := pevent.NewReadyEvent(d.info.GetID())
 	wrapEvent := newWrapReadyEvent(server, event)
 
-	c.getMessageCh(d.workerIndex) <- wrapEvent
+	c.getMessageCh(d.workerIndex).In() <- wrapEvent
 }
 
 func (c *eventBroker) sendNotReusableEvent(
@@ -198,10 +202,10 @@ func (c *eventBroker) sendNotReusableEvent(
 	wrapEvent := newWrapNotReusableEvent(server, event)
 
 	// must success unless we can do retry later
-	c.getMessageCh(d.workerIndex) <- wrapEvent
+	c.getMessageCh(d.workerIndex).In() <- wrapEvent
 }
 
-func (c *eventBroker) getMessageCh(workerIndex int) chan *wrapEvent {
+func (c *eventBroker) getMessageCh(workerIndex int) *chann.Chann[*wrapEvent] {
 	return c.messageCh[workerIndex]
 }
 
@@ -256,7 +260,7 @@ func (c *eventBroker) tickTableTriggerDispatchers(ctx context.Context) {
 								dispatcherStat.isInitialized.Store(true)
 							},
 						}
-						c.getMessageCh(dispatcherStat.workerIndex) <- wrapE
+						c.getMessageCh(dispatcherStat.workerIndex).In() <- wrapE
 						return true
 					}
 
@@ -314,7 +318,7 @@ func (c *eventBroker) sendDDL(ctx context.Context, remoteID node.ID, e pevent.DD
 	select {
 	case <-ctx.Done():
 		return
-	case c.getMessageCh(d.workerIndex) <- ddlEvent:
+	case c.getMessageCh(d.workerIndex).In() <- ddlEvent:
 		d.metricEventServiceSendDDLCount.Inc()
 	}
 }
@@ -394,7 +398,7 @@ func (c *eventBroker) checkAndInitDispatcher(task scanTask) {
 		},
 	}
 	//log.Info("Send handshake event to dispatcher", zap.Uint64("seq", wrapE.e.(*pevent.HandshakeEvent).Seq), zap.Stringer("dispatcher", task.id))
-	c.getMessageCh(task.workerIndex) <- wrapE
+	c.getMessageCh(task.workerIndex).In() <- wrapE
 }
 
 // emitSyncPointEventIfNeeded emits a sync point event if the current ts is greater than the next sync point, and updates the next sync point.
@@ -409,7 +413,7 @@ func (c *eventBroker) emitSyncPointEventIfNeeded(ts uint64, d *dispatcherStat, r
 				DispatcherID: d.id,
 				CommitTs:     ts},
 			d.getEventSenderState())
-		c.getMessageCh(d.workerIndex) <- syncPointEvent
+		c.getMessageCh(d.workerIndex).In() <- syncPointEvent
 		d.nextSyncPoint = oracle.GoTimeToTS(oracle.GetTimeFromTS(d.nextSyncPoint).Add(d.syncPointInterval))
 	}
 }
@@ -486,7 +490,7 @@ func (c *eventBroker) doScan(ctx context.Context, task scanTask) {
 		}
 		dml.Seq = task.seq.Add(1)
 		c.emitSyncPointEventIfNeeded(dml.CommitTs, task, remoteID)
-		c.getMessageCh(task.workerIndex) <- newWrapDMLEvent(remoteID, dml, task.getEventSenderState())
+		c.getMessageCh(task.workerIndex).In() <- newWrapDMLEvent(remoteID, dml, task.getEventSenderState())
 		task.metricEventServiceSendKvCount.Add(float64(dml.Len()))
 	}
 
@@ -536,7 +540,7 @@ func (c *eventBroker) runSendMessageWorker(ctx context.Context, workerIndex int)
 			select {
 			case <-ctx.Done():
 				return
-			case m := <-messageCh:
+			case m := <-messageCh.Out():
 				if m.msgType == pevent.TypeResolvedEvent {
 					c.handleResolvedTs(ctx, resolvedTsCacheMap, m)
 					continue
