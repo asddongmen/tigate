@@ -263,7 +263,7 @@ func (s *stream[A, P, T, D, H]) start(acceptedPaths []*pathInfo[A, P, T, D, H], 
 		panic("The stream has been closed.")
 	}
 	if s.option.UseBuffer {
-		go s.reciever()
+		go s.receiver()
 	}
 
 	s.handleWg.Add(1)
@@ -290,7 +290,7 @@ func (s *stream[A, P, T, D, H]) close(wait ...bool) {
 	}
 }
 
-func (s *stream[A, P, T, D, H]) reciever() {
+func (s *stream[A, P, T, D, H]) receiver() {
 	buffer := deque.NewDeque[eventWrap[A, P, T, D, H]](BlockLenInPendingQueue)
 	defer func() {
 		// Move all remaining events in the buffer to the outChan.
@@ -306,7 +306,21 @@ func (s *stream[A, P, T, D, H]) reciever() {
 		}
 		close(s.outChan)
 	}()
+
 	for {
+
+		// Try to get the event from the inChan first.
+		select {
+		case e, ok := <-s.inChan:
+			if !ok {
+				return
+			}
+			buffer.PushBack(e)
+			s.bufferCount.Add(1)
+			continue
+		default:
+		}
+
 		event, ok := buffer.FrontRef()
 		if !ok {
 			e, ok := <-s.inChan
