@@ -274,7 +274,7 @@ func (w *Writer) generateBatchSQLInUnSafeMode(events []*commonEvent.DMLEvent) ([
 		PreRowKeys []byte
 	}
 
-	// Step 1 extract all rows in these events to rowLists, and calcuate row key for each row(based on pk value)
+	// Step 1 extract all rows in these events to rowLists, and calculate row key for each row(based on pk value)
 	rowLists := make([]RowChangeWithKeys, 0)
 	for _, event := range events {
 		for {
