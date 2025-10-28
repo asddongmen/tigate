@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
 	"time"
@@ -600,6 +601,14 @@ func (w *Writer) generateNormalSQL(event *commonEvent.DMLEvent) ([]string, [][]i
 }
 
 func (w *Writer) execDMLWithMaxRetries(dmls *preparedDMLs) error {
+
+	// For test
+	if rand.Intn(1000) <= 10 {
+		return cerror.WrapError(cerror.ErrMySQLDuplicateEntry, &dmysql.MySQLError{
+			Number: uint16(mysql.ErrDupEntry),
+		})
+	}
+
 	if len(dmls.sqls) != len(dmls.values) {
 		return cerror.ErrUnexpected.FastGenByArgs(fmt.Sprintf("unexpected number of sqls and values, sqls is %s, values is %s", dmls.sqls, dmls.values))
 	}
