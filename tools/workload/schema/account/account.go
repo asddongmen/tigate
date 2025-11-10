@@ -107,7 +107,6 @@ const (
 	fixedAuditOrder              = "audit-order"
 	fixedDemand                  = "120.000000"
 	fixedActiveStatus            = "ACTIVE"
-	fixedBizID                   = "biz-001"
 	fixedBonusStatus             = 0
 	fixedBonusTime               = 1700000000
 	fixedWalletType              = 1
@@ -175,6 +174,7 @@ func (w *AccountWorkload) BuildDeleteSql(opts schema.DeleteOption) string {
 func (w *AccountWorkload) buildRowValues() string {
 	id := rand.Int63()
 	siteCode := rand.Intn(512)
+	bizID := fmt.Sprintf("biz-%d-%d", siteCode, id)
 
 	return fmt.Sprintf(
 		"%d,'%d',%d,%d,%d,%d,'%s',%d,%d,%s,%s,'%s',%d,'%s',%d,'%s','%s','%s','%s','%s','%s','%s','%s','%s',%d,%d,%d,%s,%s,'%s',%s,'%s','%s',%d,%d,%d",
@@ -210,7 +210,7 @@ func (w *AccountWorkload) buildRowValues() string {
 		fixedAuditOrder,
 		fixedDemand,
 		fixedActiveStatus,
-		fixedBizID,
+		bizID,
 		fixedBonusStatus,
 		fixedBonusTime,
 		fixedWalletType,
