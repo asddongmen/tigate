@@ -9,7 +9,7 @@ import (
 )
 
 const createAccountDetailsTable = `
-CREATE TABLE IF NOT EXISTS dh_account_details_%[1]d (
+CREATE TABLE IF NOT EXISTS account_%[1]d (
   c_id bigint NOT NULL,
   c_site varchar(64) NOT NULL DEFAULT '',
   c_created_at int NOT NULL DEFAULT 0,
@@ -115,18 +115,18 @@ const (
 	fixedRemarkBackUpdated       = "remark-back-updated"
 )
 
-type AccountDetailsWorkload struct{}
+type AccountWorkload struct{}
 
-func NewAccountDetailsWorkload() schema.Workload {
-	return &AccountDetailsWorkload{}
+func NewAccountWorkload() schema.Workload {
+	return &AccountWorkload{}
 }
 
-func (w *AccountDetailsWorkload) BuildCreateTableStatement(n int) string {
+func (w *AccountWorkload) BuildCreateTableStatement(n int) string {
 	return fmt.Sprintf(createAccountDetailsTable, n)
 }
 
-func (w *AccountDetailsWorkload) BuildInsertSql(tableN int, batchSize int) string {
-	tableName := fmt.Sprintf("dh_account_details_%d", tableN)
+func (w *AccountWorkload) BuildInsertSql(tableN int, batchSize int) string {
+	tableName := fmt.Sprintf("account_%d", tableN)
 	var buf bytes.Buffer
 	buf.WriteString(fmt.Sprintf("INSERT INTO %s (%s) VALUES", tableName, accountDetailsColumns))
 
@@ -141,8 +141,8 @@ func (w *AccountDetailsWorkload) BuildInsertSql(tableN int, batchSize int) strin
 	return buf.String()
 }
 
-func (w *AccountDetailsWorkload) BuildUpdateSql(opt schema.UpdateOption) string {
-	tableName := fmt.Sprintf("dh_account_details_%d", opt.TableIndex)
+func (w *AccountWorkload) BuildUpdateSql(opt schema.UpdateOption) string {
+	tableName := fmt.Sprintf("account_%d", opt.TableIndex)
 	var buf bytes.Buffer
 	for i := 0; i < opt.Batch; i++ {
 		if i > 0 {
@@ -160,8 +160,8 @@ func (w *AccountDetailsWorkload) BuildUpdateSql(opt schema.UpdateOption) string 
 	return buf.String()
 }
 
-func (w *AccountDetailsWorkload) BuildDeleteSql(opts schema.DeleteOption) string {
-	tableName := fmt.Sprintf("dh_account_details_%d", opts.TableIndex)
+func (w *AccountWorkload) BuildDeleteSql(opts schema.DeleteOption) string {
+	tableName := fmt.Sprintf("account_%d", opts.TableIndex)
 	switch rand.Intn(3) {
 	case 0:
 		return fmt.Sprintf("DELETE FROM %s WHERE c_site = '%d' LIMIT %d", tableName, rand.Intn(512), opts.Batch)
@@ -172,7 +172,7 @@ func (w *AccountDetailsWorkload) BuildDeleteSql(opts schema.DeleteOption) string
 	}
 }
 
-func (w *AccountDetailsWorkload) buildRowValues() string {
+func (w *AccountWorkload) buildRowValues() string {
 	id := rand.Int63()
 	siteCode := rand.Intn(512)
 

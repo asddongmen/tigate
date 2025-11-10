@@ -24,12 +24,12 @@ import (
 	"time"
 
 	"workload/schema"
+	paccount "workload/schema/account"
 	pbank "workload/schema/bank"
 	pbank2 "workload/schema/bank2"
 	"workload/schema/bankupdate"
 	pcrawler "workload/schema/crawler"
 	pdc "workload/schema/dc"
-	paccountdetails "workload/schema/dhaccountdetails"
 	"workload/schema/largerow"
 	"workload/schema/shop"
 	psysbench "workload/schema/sysbench"
@@ -78,7 +78,7 @@ const (
 	bank2          = "bank2"
 	bankUpdate     = "bank_update"
 	dc             = "dc"
-	accountDetails = "dh_account_details"
+	accountDetails = "account"
 )
 
 // stmtCacheKey is used as the key for statement cache
@@ -97,15 +97,17 @@ func NewWorkloadApp(config *WorkloadConfig) *WorkloadApp {
 
 // Initialize initializes the workload application
 func (app *WorkloadApp) Initialize() error {
-	// set database connection
-	dbManager, err := NewDBManager(app.Config)
-	if err != nil {
-		return err
-	}
-	app.DBManager = dbManager
+	if app.Config.Action != "createDB" {
+		// set database connection
+		dbManager, err := NewDBManager(app.Config)
+		if err != nil {
+			return err
+		}
+		app.DBManager = dbManager
 
-	// create workload
-	app.Workload = app.createWorkload()
+		// create workload
+		app.Workload = app.createWorkload()
+	}
 
 	return nil
 }
@@ -138,7 +140,7 @@ func (app *WorkloadApp) createWorkload() schema.Workload {
 	case dc:
 		workload = pdc.NewDCWorkload()
 	case accountDetails:
-		workload = paccountdetails.NewAccountDetailsWorkload()
+		workload = paccount.NewAccountWorkload()
 	default:
 		plog.Panic("unsupported workload type", zap.String("workload", app.Config.WorkloadType))
 	}
@@ -147,6 +149,10 @@ func (app *WorkloadApp) createWorkload() schema.Workload {
 
 // Execute executes the workload
 func (app *WorkloadApp) Execute() error {
+	if app.Config.Action == "createDB" {
+		return app.handleCreateDBAction()
+	}
+
 	wg := &sync.WaitGroup{}
 	err := app.executeWorkload(wg)
 	if err != nil {
@@ -221,6 +227,54 @@ func (app *WorkloadApp) handleWorkloadExecution(insertConcurrency, updateConcurr
 	if app.Config.Action == "write" || app.Config.Action == "delete" {
 		app.executeDeleteWorkers(deleteConcurrency, wg)
 	}
+}
+
+// handleCreateDBAction creates databases based on configuration
+func (app *WorkloadApp) handleCreateDBAction() error {
+	if app.Config.DBPrefix == "" {
+		return fmt.Errorf("db-prefix is required when action is createDB")
+	}
+	if app.Config.DBNum <= 0 {
+		return fmt.Errorf("db-num must be greater than 0 when action is createDB")
+	}
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&parseTime=True&loc=Local&multiStatements=true",
+		app.Config.DBUser,
+		app.Config.DBPassword,
+		app.Config.DBHost,
+		app.Config.DBPort,
+	)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return errors.Annotate(err, "failed to open base connection")
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		return errors.Annotate(err, "failed to ping base connection")
+	}
+
+	for i := 1; i <= app.Config.DBNum; i++ {
+		dbName := fmt.Sprintf("%s%d", app.Config.DBPrefix, i)
+		plog.Info("creating database",
+			zap.String("database", dbName),
+			zap.String("host", app.Config.DBHost),
+			zap.Int("port", app.Config.DBPort))
+
+		_, err := db.ExecContext(context.Background(), fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName))
+		if err != nil {
+			plog.Error("create database failed", zap.Error(err), zap.String("database", dbName))
+			return errors.Annotatef(err, "failed to create database %s", dbName)
+		}
+	}
+
+	plog.Info("create database action finished",
+		zap.String("prefix", app.Config.DBPrefix),
+		zap.Int("count", app.Config.DBNum))
+	return nil
 }
 
 // initTables initializes tables
