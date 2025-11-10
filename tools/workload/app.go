@@ -23,19 +23,21 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pingcap/errors"
-	plog "github.com/pingcap/log"
-	"go.uber.org/zap"
 	"workload/schema"
 	pbank "workload/schema/bank"
 	pbank2 "workload/schema/bank2"
 	"workload/schema/bankupdate"
 	pcrawler "workload/schema/crawler"
 	pdc "workload/schema/dc"
+	paccountdetails "workload/schema/dhaccountdetails"
 	"workload/schema/largerow"
 	"workload/schema/shop"
 	psysbench "workload/schema/sysbench"
 	puuu "workload/schema/uuu"
+
+	"github.com/pingcap/errors"
+	plog "github.com/pingcap/log"
+	"go.uber.org/zap"
 )
 
 // WorkloadExecutor executes the workload and collects statistics
@@ -67,15 +69,16 @@ type WorkloadApp struct {
 }
 
 const (
-	bank       = "bank"
-	sysbench   = "sysbench"
-	largeRow   = "large_row"
-	shopItem   = "shop_item"
-	uuu        = "uuu"
-	crawler    = "crawler"
-	bank2      = "bank2"
-	bankUpdate = "bank_update"
-	dc         = "dc"
+	bank           = "bank"
+	sysbench       = "sysbench"
+	largeRow       = "large_row"
+	shopItem       = "shop_item"
+	uuu            = "uuu"
+	crawler        = "crawler"
+	bank2          = "bank2"
+	bankUpdate     = "bank_update"
+	dc             = "dc"
+	accountDetails = "dh_account_details"
 )
 
 // stmtCacheKey is used as the key for statement cache
@@ -134,6 +137,8 @@ func (app *WorkloadApp) createWorkload() schema.Workload {
 		workload = bankupdate.NewBankUpdateWorkload(app.Config.TotalRowCount, app.Config.UpdateLargeColumnSize)
 	case dc:
 		workload = pdc.NewDCWorkload()
+	case accountDetails:
+		workload = paccountdetails.NewAccountDetailsWorkload()
 	default:
 		plog.Panic("unsupported workload type", zap.String("workload", app.Config.WorkloadType))
 	}
