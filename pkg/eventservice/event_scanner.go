@@ -123,6 +123,7 @@ func (s *eventScanner) scan(
 
 	// Fetch DDL events
 	start := time.Now()
+	time.Sleep(time.Millisecond * 200)
 	events, err := s.fetchDDLEvents(dispatcherStat, dataRange)
 	if err != nil {
 		return 0, nil, false, err
