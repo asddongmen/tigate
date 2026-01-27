@@ -1285,6 +1285,7 @@ func (e *eventStore) writeEvents(db *pebble.DB, events []eventWithCallback, enco
 	metrics.EventStoreWriteBatchSizeHist.Observe(float64(batch.Len()))
 	metrics.EventStoreWriteBytes.Add(float64(batch.Len()))
 	start := time.Now()
+	time.Sleep(time.Millisecond * 20)
 	err := batch.Commit(pebble.NoSync)
 	metrics.EventStoreWriteDurationHistogram.Observe(float64(time.Since(start).Milliseconds()) / 1000)
 	return err
