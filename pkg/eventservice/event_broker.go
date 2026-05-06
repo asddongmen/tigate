@@ -270,6 +270,7 @@ func (c *eventBroker) refreshMinSentResolvedTs(ctx context.Context) error {
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case <-ticker.C:
+			continue
 			c.changefeedMap.Range(func(key, value interface{}) bool {
 				status := value.(*changefeedStatus)
 				status.refreshMinSentResolvedTs()
@@ -434,7 +435,7 @@ func (c *eventBroker) getScanTaskDataRange(task scanTask) (bool, common.DataRang
 	// this dispatcher still has pending ddl to catch up.
 	hasPendingDDLEventInCurrentRange := dataRange.CommitTsStart < ddlState.MaxEventCommitTs &&
 		ddlState.MaxEventCommitTs <= commitTsEndBeforeWindow
-	scanMaxTs := task.changefeedStat.getScanMaxTs()
+	scanMaxTs := uint64(0)
 	if scanMaxTs > 0 {
 		dataRange.CommitTsEnd = min(dataRange.CommitTsEnd, scanMaxTs)
 		if dataRange.CommitTsEnd < commitTsEndBeforeWindow {
