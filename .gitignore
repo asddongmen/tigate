@@ -10,7 +10,6 @@ tools/workload/bin
 *.log
 .DS_Store
 .test
-.codex
 
 # Unit test reports
 cdc-junit-report.xml

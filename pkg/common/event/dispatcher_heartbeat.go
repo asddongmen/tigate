@@ -23,45 +23,25 @@ import (
 
 const (
 	DispatcherHeartbeatVersion1         = 1
-	DispatcherHeartbeatVersion2         = 2
 	DispatcherHeartbeatResponseVersion1 = 1
-	DispatcherProgressVersion1          = 1
 )
 
-// DispatcherProgressLegacy is the legacy wire format used by heartbeat v1.
-type DispatcherProgressLegacy struct {
-	DispatcherID common.DispatcherID
-	CheckpointTs uint64 // 8 bytes
-}
-
-func (dp DispatcherProgressLegacy) GetSize() int {
-	return dp.DispatcherID.GetSize() + 8 // dispatcherID size + checkpointTs size
-}
-
-func (dp DispatcherProgressLegacy) Marshal() ([]byte, error) {
-	buf := bytes.NewBuffer(make([]byte, 0))
-	buf.Write(dp.DispatcherID.Marshal())
-	binary.Write(buf, binary.BigEndian, dp.CheckpointTs)
-	return buf.Bytes(), nil
-}
-
-func (dp *DispatcherProgressLegacy) Unmarshal(data []byte) error {
-	buf := bytes.NewBuffer(data)
-	dp.DispatcherID.Unmarshal(buf.Next(dp.DispatcherID.GetSize()))
-	dp.CheckpointTs = binary.BigEndian.Uint64(buf.Next(8))
-	return nil
-}
-
-// DispatcherProgress is the current wire format used by heartbeat v2+.
+// DispatcherProgress is used to report the progress of a dispatcher to the EventService
+// It is a part of DispatcherHeartbeat, so it has no version field.
 type DispatcherProgress struct {
-	Version      byte
 	DispatcherID common.DispatcherID
 	CheckpointTs uint64 // 8 bytes
-	Epoch        uint64 // 8 bytes
+}
+
+func NewDispatcherProgress(dispatcherID common.DispatcherID, checkpointTs uint64) DispatcherProgress {
+	return DispatcherProgress{
+		DispatcherID: dispatcherID,
+		CheckpointTs: checkpointTs,
+	}
 }
 
 func (dp DispatcherProgress) GetSize() int {
-	return 1 + dp.DispatcherID.GetSize() + 8 + 8
+	return dp.DispatcherID.GetSize() + 8 // dispatcherID size + checkpointTs size
 }
 
 func (dp DispatcherProgress) Marshal() ([]byte, error) {
@@ -74,68 +54,44 @@ func (dp *DispatcherProgress) Unmarshal(data []byte) error {
 
 func (dp DispatcherProgress) encodeV1() ([]byte, error) {
 	buf := bytes.NewBuffer(make([]byte, 0))
-	buf.WriteByte(dp.Version)
 	buf.Write(dp.DispatcherID.Marshal())
 	binary.Write(buf, binary.BigEndian, dp.CheckpointTs)
-	binary.Write(buf, binary.BigEndian, dp.Epoch)
 	return buf.Bytes(), nil
 }
 
 func (dp *DispatcherProgress) decodeV1(data []byte) error {
 	buf := bytes.NewBuffer(data)
-	version, err := buf.ReadByte()
-	if err != nil {
-		return err
-	}
-	dp.Version = version
-	if dp.Version != DispatcherProgressVersion1 {
-		return fmt.Errorf("unsupported DispatcherProgress version: %d", dp.Version)
-	}
 	dp.DispatcherID.Unmarshal(buf.Next(dp.DispatcherID.GetSize()))
 	dp.CheckpointTs = binary.BigEndian.Uint64(buf.Next(8))
-	dp.Epoch = binary.BigEndian.Uint64(buf.Next(8))
 	return nil
 }
 
 // DispatcherHeartbeat is used to report the progress of a dispatcher to the EventService
 type DispatcherHeartbeat struct {
-	Version                    int
-	ClusterID                  uint64
-	DispatcherCount            uint32
-	DispatcherProgressesLegacy []DispatcherProgressLegacy
-	DispatcherProgresses       []DispatcherProgress
+	Version              int
+	ClusterID            uint64
+	DispatcherCount      uint32
+	DispatcherProgresses []DispatcherProgress
 }
 
-func NewDispatcherHeartbeat() *DispatcherHeartbeat {
+func NewDispatcherHeartbeat(dispatcherCount int) *DispatcherHeartbeat {
 	return &DispatcherHeartbeat{
-		Version: DispatcherHeartbeatVersion2,
+		Version: DispatcherHeartbeatVersion1,
 		// TODO: Pass a real clusterID when we support 1 TiCDC cluster subscribe multiple TiDB clusters
-		ClusterID:                  0,
-		DispatcherProgressesLegacy: make([]DispatcherProgressLegacy, 0),
-		DispatcherProgresses:       make([]DispatcherProgress, 0),
+		ClusterID:            0,
+		DispatcherProgresses: make([]DispatcherProgress, 0, dispatcherCount),
 	}
 }
 
-func (d *DispatcherHeartbeat) AddDispatcherProgress(dispatcherID common.DispatcherID, checkpointTs uint64, epoch uint64) {
+func (d *DispatcherHeartbeat) Append(dp DispatcherProgress) {
 	d.DispatcherCount++
-	d.DispatcherProgresses = append(d.DispatcherProgresses, DispatcherProgress{
-		Version:      DispatcherProgressVersion1,
-		DispatcherID: dispatcherID,
-		CheckpointTs: checkpointTs,
-		Epoch:        epoch,
-	})
+	d.DispatcherProgresses = append(d.DispatcherProgresses, dp)
 }
 
 func (d *DispatcherHeartbeat) GetSize() int {
 	size := 8 // clusterID
 	size += 4 // dispatcher count
-	if d.Version >= DispatcherHeartbeatVersion2 {
-		for _, dp := range d.DispatcherProgresses {
-			size += dp.GetSize()
-		}
-		return size
-	}
-	for _, dp := range d.DispatcherProgressesLegacy {
+	for _, dp := range d.DispatcherProgresses {
 		size += dp.GetSize()
 	}
 	return size
@@ -148,11 +104,6 @@ func (d *DispatcherHeartbeat) Marshal() ([]byte, error) {
 	switch d.Version {
 	case DispatcherHeartbeatVersion1:
 		payload, err = d.encodeV1()
-		if err != nil {
-			return nil, err
-		}
-	case DispatcherHeartbeatVersion2:
-		payload, err = d.encodeV2()
 		if err != nil {
 			return nil, err
 		}
@@ -178,45 +129,12 @@ func (d *DispatcherHeartbeat) Unmarshal(data []byte) error {
 	switch version {
 	case DispatcherHeartbeatVersion1:
 		return d.decodeV1(payload)
-	case DispatcherHeartbeatVersion2:
-		return d.decodeV2(payload)
 	default:
 		return fmt.Errorf("unsupported DispatcherHeartbeat version: %d", version)
 	}
 }
 
 func (d *DispatcherHeartbeat) encodeV1() ([]byte, error) {
-	buf := bytes.NewBuffer(make([]byte, 0))
-	binary.Write(buf, binary.BigEndian, d.ClusterID)
-	binary.Write(buf, binary.BigEndian, d.DispatcherCount)
-	for _, dp := range d.DispatcherProgressesLegacy {
-		dpData, err := dp.Marshal()
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(dpData)
-	}
-	return buf.Bytes(), nil
-}
-
-func (d *DispatcherHeartbeat) decodeV1(data []byte) error {
-	buf := bytes.NewBuffer(data)
-	d.ClusterID = binary.BigEndian.Uint64(buf.Next(8))
-	d.DispatcherCount = binary.BigEndian.Uint32(buf.Next(4))
-	d.DispatcherProgressesLegacy = make([]DispatcherProgressLegacy, 0, d.DispatcherCount)
-	d.DispatcherProgresses = nil
-	for range d.DispatcherCount {
-		var dp DispatcherProgressLegacy
-		dpData := buf.Next(dp.GetSize())
-		if err := dp.Unmarshal(dpData); err != nil {
-			return err
-		}
-		d.DispatcherProgressesLegacy = append(d.DispatcherProgressesLegacy, dp)
-	}
-	return nil
-}
-
-func (d *DispatcherHeartbeat) encodeV2() ([]byte, error) {
 	buf := bytes.NewBuffer(make([]byte, 0))
 	binary.Write(buf, binary.BigEndian, d.ClusterID)
 	binary.Write(buf, binary.BigEndian, d.DispatcherCount)
@@ -230,11 +148,10 @@ func (d *DispatcherHeartbeat) encodeV2() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (d *DispatcherHeartbeat) decodeV2(data []byte) error {
+func (d *DispatcherHeartbeat) decodeV1(data []byte) error {
 	buf := bytes.NewBuffer(data)
 	d.ClusterID = binary.BigEndian.Uint64(buf.Next(8))
 	d.DispatcherCount = binary.BigEndian.Uint32(buf.Next(4))
-	d.DispatcherProgressesLegacy = nil
 	d.DispatcherProgresses = make([]DispatcherProgress, 0, d.DispatcherCount)
 	for range d.DispatcherCount {
 		var dp DispatcherProgress
