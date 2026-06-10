@@ -126,6 +126,10 @@ type urlConfig struct {
 	WriteTimeout                 *string `form:"write-timeout"`
 	ReadTimeout                  *string `form:"read-timeout"`
 	RequiredAcks                 *int    `form:"required-acks"`
+	DryRun                       *bool   `form:"dry-run"`
+	MQDryRun                     *bool   `form:"mq-dry-run"`
+	DryRunDelay                  *string `form:"dry-run-delay"`
+	MQDryRunDelay                *string `form:"mq-dry-run-delay"`
 	SASLUser                     *string `form:"sasl-user"`
 	SASLPassword                 *string `form:"sasl-password"`
 	SASLMechanism                *string `form:"sasl-mechanism"`
@@ -176,6 +180,10 @@ type options struct {
 	WriteTimeout          time.Duration
 	ReadTimeout           time.Duration
 	KeepConnAliveInterval time.Duration
+
+	// DryRun skips real Kafka network writes while keeping MQ encoding and routing.
+	DryRun      bool
+	DryRunDelay time.Duration
 }
 
 // NewOptions returns a default Kafka configuration
@@ -314,6 +322,34 @@ func (o *options) Apply(changefeedID common.ChangeFeedID,
 		o.RequiredAcks = r
 	}
 
+	if urlParameter.DryRun != nil {
+		o.DryRun = *urlParameter.DryRun
+	}
+	if urlParameter.MQDryRun != nil {
+		o.DryRun = *urlParameter.MQDryRun
+	}
+	if o.DryRun {
+		delay := ""
+		if urlParameter.DryRunDelay != nil {
+			delay = *urlParameter.DryRunDelay
+		}
+		if urlParameter.MQDryRunDelay != nil {
+			delay = *urlParameter.MQDryRunDelay
+		}
+		if delay != "" {
+			o.DryRunDelay, err = parseDryRunDelay(delay)
+			if err != nil {
+				return err
+			}
+		}
+		if o.PartitionNum == 0 {
+			o.PartitionNum = defaultPartitionNum
+		}
+		log.Info("Kafka dry-run mode is enabled, will not write data to Kafka",
+			zap.Duration("dryRunDelay", o.DryRunDelay),
+			zap.Int32("partitionNum", o.PartitionNum))
+	}
+
 	err = o.applySASL(urlParameter, sinkConfig)
 	if err != nil {
 		return err
@@ -325,6 +361,18 @@ func (o *options) Apply(changefeedID common.ChangeFeedID,
 	}
 
 	return nil
+}
+
+func parseDryRunDelay(delay string) (time.Duration, error) {
+	duration, err := time.ParseDuration(delay)
+	if err == nil {
+		return duration, nil
+	}
+	delayInMS, parseIntErr := strconv.Atoi(delay)
+	if parseIntErr == nil {
+		return time.Duration(delayInMS) * time.Millisecond, nil
+	}
+	return 0, err
 }
 
 func mergeConfig(

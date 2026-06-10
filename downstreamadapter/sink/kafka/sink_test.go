@@ -266,3 +266,21 @@ func TestKafkaSinkBasicFunctionality(t *testing.T) {
 	cancel()
 	kafkaSink.AddCheckpointTs(12345)
 }
+
+func TestKafkaSinkDryRunNew(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	openProtocol := "open-protocol"
+	sinkConfig := &config.SinkConfig{Protocol: &openProtocol}
+	sinkURI, err := url.Parse("kafka://127.0.0.1:1/dry-run-topic?dry-run=true&partition-num=16&protocol=open-protocol")
+	require.NoError(t, err)
+
+	kafkaSink, err := New(ctx, common.NewChangefeedID4Test("test", "dry-run"), sinkURI, sinkConfig)
+	require.NoError(t, err)
+	defer kafkaSink.Close(false)
+
+	partitionNum, err := kafkaSink.comp.topicManager.GetPartitionNum(ctx, "dry-run-topic")
+	require.NoError(t, err)
+	require.Equal(t, int32(16), partitionNum)
+}

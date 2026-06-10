@@ -38,6 +38,14 @@ func NewSaramaFactory(
 	o *options,
 	changefeedID common.ChangeFeedID,
 ) (Factory, error) {
+	if o.DryRun {
+		log.Info("Kafka dry-run factory is enabled, skip creating sarama clients",
+			zap.Stringer("changefeedID", changefeedID),
+			zap.String("topic", o.Topic),
+			zap.Int32("partitionNum", o.PartitionNum))
+		return newDryRunFactory(o, changefeedID), nil
+	}
+
 	start := time.Now()
 	config, err := newSaramaConfig(ctx, o)
 	duration := time.Since(start).Seconds()

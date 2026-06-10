@@ -30,6 +30,7 @@ import (
 	cerror "github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/sink/codec/common"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
 )
 
 func TestCompleteOptions(t *testing.T) {
@@ -189,6 +190,77 @@ func TestTimeout(t *testing.T) {
 	require.Equal(t, 5*time.Second, options.DialTimeout)
 	require.Equal(t, 1000*time.Millisecond, options.ReadTimeout)
 	require.Equal(t, 2*time.Minute, options.WriteTimeout)
+}
+
+func TestDryRunOptions(t *testing.T) {
+	uri := "kafka://127.0.0.1:9092/kafka-test?dry-run=true&dry-run-delay=15" +
+		"&auto-create-topic=false"
+	sinkURI, err := url.Parse(uri)
+	require.NoError(t, err)
+
+	options := NewOptions()
+	err = options.Apply(
+		commonType.NewChangefeedID4Test(commonType.DefaultKeyspaceName, "test"),
+		sinkURI,
+		config.GetDefaultReplicaConfig().Sink,
+	)
+	require.NoError(t, err)
+	require.True(t, options.DryRun)
+	require.Equal(t, 15*time.Millisecond, options.DryRunDelay)
+	require.Equal(t, int32(defaultPartitionNum), options.PartitionNum)
+
+	uri = "kafka://127.0.0.1:9092/kafka-test?mq-dry-run=true&mq-dry-run-delay=20ms" +
+		"&partition-num=128"
+	sinkURI, err = url.Parse(uri)
+	require.NoError(t, err)
+	options = NewOptions()
+	err = options.Apply(
+		commonType.NewChangefeedID4Test(commonType.DefaultKeyspaceName, "test"),
+		sinkURI,
+		config.GetDefaultReplicaConfig().Sink,
+	)
+	require.NoError(t, err)
+	require.True(t, options.DryRun)
+	require.Equal(t, 20*time.Millisecond, options.DryRunDelay)
+	require.Equal(t, int32(128), options.PartitionNum)
+}
+
+func TestDryRunFactory(t *testing.T) {
+	ctx := context.Background()
+	uri := "kafka://127.0.0.1:1/kafka-test?dry-run=true&partition-num=32"
+	sinkURI, err := url.Parse(uri)
+	require.NoError(t, err)
+
+	options := NewOptions()
+	err = options.Apply(
+		commonType.NewChangefeedID4Test(commonType.DefaultKeyspaceName, "test"),
+		sinkURI,
+		config.GetDefaultReplicaConfig().Sink,
+	)
+	require.NoError(t, err)
+	options.Topic = "kafka-test"
+
+	changefeedID := commonType.NewChangefeedID4Test(commonType.DefaultKeyspaceName, "test")
+	factory, err := NewSaramaFactory(ctx, options, changefeedID)
+	require.NoError(t, err)
+
+	adminClient, err := factory.AdminClient(ctx)
+	require.NoError(t, err)
+	topics, err := adminClient.GetTopicsMeta([]string{"kafka-test"}, false)
+	require.NoError(t, err)
+	require.Equal(t, int32(32), topics["kafka-test"].NumPartitions)
+
+	syncProducer, err := factory.SyncProducer(ctx)
+	require.NoError(t, err)
+	require.NoError(t, syncProducer.SendMessage("kafka-test", 0, &common.Message{}))
+
+	asyncProducer, err := factory.AsyncProducer(ctx)
+	require.NoError(t, err)
+	var called atomic.Bool
+	require.NoError(t, asyncProducer.AsyncSend(ctx, "kafka-test", 0, &common.Message{
+		Callback: func() { called.Store(true) },
+	}))
+	require.True(t, called.Load())
 }
 
 func TestAdjustConfigTopicNotExist(t *testing.T) {
