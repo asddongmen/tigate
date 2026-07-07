@@ -28,6 +28,15 @@ import (
 	"github.com/tikv/client-go/v2/tikv"
 )
 
+func requireClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	default:
+		require.Fail(t, "channel is not closed")
+	}
+}
+
 // For UPDATE SQL, its prewrite event has both value and old value.
 // It is possible that TiDB prewrites multiple times for the same row when
 // there are other transactions it conflicts with. For this case,
@@ -246,7 +255,7 @@ func TestHandleEventEntriesSkipsStaleCommitValue(t *testing.T) {
 				commit,
 			},
 		},
-	})
+	}, func() {})
 
 	require.Empty(t, subSpan.kvEventsCache)
 	require.Nil(t, commit.Value)
@@ -285,7 +294,7 @@ func TestHandleEventEntriesSkipsCachedStaleCommitAfterInitialized(t *testing.T) 
 	}
 	handleEventEntries(subSpan, state, &cdcpb.Event_Entries_{
 		Entries: &cdcpb.Event_Entries{Entries: []*cdcpb.Event_Row{commit}},
-	})
+	}, func() {})
 	handleEventEntries(subSpan, state, &cdcpb.Event_Entries_{
 		Entries: &cdcpb.Event_Entries{
 			Entries: []*cdcpb.Event_Row{
@@ -299,12 +308,106 @@ func TestHandleEventEntriesSkipsCachedStaleCommitAfterInitialized(t *testing.T) 
 				{Type: cdcpb.Event_INITIALIZED},
 			},
 		},
-	})
+	}, func() {})
 
 	require.Empty(t, subSpan.kvEventsCache)
 	require.Nil(t, commit.Value)
 	require.Nil(t, commit.OldValue)
 	require.Empty(t, state.matcher.unmatchedValue)
+}
+
+func TestHandleEventEntriesFlushesLargeKVEventCache(t *testing.T) {
+	oldThreshold := kvEventsCacheFlushThresholdInBytes
+	oldGCThreshold := kvEventsCacheGCThresholdInBytes
+	oldForceGC := forceGC
+	kvEventsCacheFlushThresholdInBytes = 1
+	kvEventsCacheGCThresholdInBytes = 1
+	gcCount := 0
+	forceGC = func() {
+		gcCount++
+	}
+	t.Cleanup(func() {
+		kvEventsCacheFlushThresholdInBytes = oldThreshold
+		kvEventsCacheGCThresholdInBytes = oldGCThreshold
+		forceGC = oldForceGC
+	})
+
+	span := heartbeatpb.TableSpan{
+		TableID:  100,
+		StartKey: common.ToComparableKey([]byte{}),
+		EndKey:   common.ToComparableKey(common.UpperBoundKey),
+	}
+	var chunks [][]common.RawKVEntry
+	subSpan := &subscribedSpan{
+		subID:   SubscriptionID(1),
+		span:    span,
+		startTs: 0,
+		consumeKVEvents: func(events []common.RawKVEntry, _ func()) bool {
+			copied := append([]common.RawKVEntry(nil), events...)
+			chunks = append(chunks, copied)
+			return false
+		},
+		advanceResolvedTs: func(uint64) {},
+	}
+	region := newRegionInfo(
+		tikv.NewRegionVerID(1, 1, 1),
+		span,
+		&tikv.RPCContext{},
+		subSpan,
+		false,
+	)
+	region.lockedRangeState = &regionlock.LockedRangeState{}
+	region.lockedRangeState.Initialized.Store(true)
+	state := newRegionFeedState(region, uint64(subSpan.subID), &regionRequestWorker{requestCache: &requestCache{}})
+	state.start()
+
+	rows := make([]*cdcpb.Event_Row, 0, 6)
+	for i := 0; i < 3; i++ {
+		startTs := uint64(i + 1)
+		key := []byte{byte('a' + i)}
+		rows = append(rows,
+			&cdcpb.Event_Row{
+				StartTs: startTs,
+				Type:    cdcpb.Event_PREWRITE,
+				OpType:  cdcpb.Event_Row_PUT,
+				Key:     key,
+				Value:   []byte{byte('A' + i)},
+			},
+			&cdcpb.Event_Row{
+				StartTs:  startTs,
+				CommitTs: 10,
+				Type:     cdcpb.Event_COMMIT,
+				OpType:   cdcpb.Event_Row_PUT,
+				Key:      key,
+			},
+		)
+	}
+
+	handler := &regionEventHandler{}
+	processed := make(chan struct{})
+	await := handler.Handle(subSpan, regionEvent{
+		states:    []*regionFeedState{state},
+		processed: processed,
+		entries: &cdcpb.Event_Entries_{
+			Entries: &cdcpb.Event_Entries{Entries: rows},
+		},
+	})
+
+	require.False(t, await)
+	requireClosed(t, processed)
+	require.Len(t, chunks, 3)
+	for i, chunk := range chunks {
+		require.Len(t, chunk, 1)
+		require.Equal(t, []byte{byte('a' + i)}, chunk[0].Key)
+		require.Equal(t, []byte{byte('A' + i)}, chunk[0].Value)
+	}
+	for _, row := range rows {
+		require.Nil(t, row.Value)
+		require.Nil(t, row.OldValue)
+	}
+	require.Empty(t, subSpan.kvEventsCache)
+	require.Zero(t, subSpan.kvEventsCacheBytes)
+	require.Equal(t, 3, gcCount)
 }
 
 func TestHandleResolvedTs(t *testing.T) {

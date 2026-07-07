@@ -104,6 +104,12 @@ type rangeTask struct {
 
 const kvEventsCacheMaxSize = 32
 
+var kvEventsCacheFlushThresholdInBytes = int64(64 * 1024 * 1024)
+
+var kvEventsCacheGCThresholdInBytes = int64(512 * 1024 * 1024)
+
+var regionEventBackpressureThresholdInBytes = int64(1 * 1024 * 1024)
+
 // subscribedSpan represents a span to subscribe.
 // It contains a sub span of a table(or the total span of a table),
 // the startTs of the table, and the output event channel.
@@ -128,6 +134,10 @@ type subscribedSpan struct {
 	advanceInterval int64
 
 	kvEventsCache []common.RawKVEntry
+	// kvEventsCacheBytes tracks the retained payload size in kvEventsCache.
+	kvEventsCacheBytes int64
+	// kvEventsCacheReleasedBytesSinceGC tracks released large-batch bytes.
+	kvEventsCacheReleasedBytesSinceGC int64
 
 	// To handle span removing.
 	stopped atomic.Bool
@@ -149,6 +159,17 @@ func (span *subscribedSpan) clearKVEventsCache() {
 	} else {
 		span.kvEventsCache = span.kvEventsCache[:0]
 	}
+	span.kvEventsCacheBytes = 0
+}
+
+func (span *subscribedSpan) appendKVEvent(event common.RawKVEntry) {
+	span.kvEventsCache = append(span.kvEventsCache, event)
+	span.kvEventsCacheBytes += event.GetSize()
+}
+
+func (span *subscribedSpan) shouldFlushKVEventsCache() bool {
+	return kvEventsCacheFlushThresholdInBytes > 0 &&
+		span.kvEventsCacheBytes >= kvEventsCacheFlushThresholdInBytes
 }
 
 type SubscriptionClientConfig struct {
@@ -403,9 +424,18 @@ func (s *subscriptionClient) wakeSubscription(subID SubscriptionID) {
 }
 
 func (s *subscriptionClient) pushRegionEventToDS(subID SubscriptionID, event regionEvent) {
+	var processed <-chan struct{}
+	if event.entries != nil &&
+		regionEventBackpressureThresholdInBytes > 0 &&
+		int64(event.getSize()) >= regionEventBackpressureThresholdInBytes {
+		ch := make(chan struct{})
+		event.processed = ch
+		processed = ch
+	}
 	// fast path
 	if !s.paused.Load() {
 		s.ds.Push(subID, event)
+		s.waitRegionEventProcessed(processed)
 		return
 	}
 	// slow path: wait until paused is false
@@ -421,6 +451,17 @@ func (s *subscriptionClient) pushRegionEventToDS(subID SubscriptionID, event reg
 	}
 	s.mu.Unlock()
 	s.ds.Push(subID, event)
+	s.waitRegionEventProcessed(processed)
+}
+
+func (s *subscriptionClient) waitRegionEventProcessed(processed <-chan struct{}) {
+	if processed == nil {
+		return
+	}
+	select {
+	case <-s.ctx.Done():
+	case <-processed:
+	}
 }
 
 func (s *subscriptionClient) handleDSFeedBack(ctx context.Context) error {

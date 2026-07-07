@@ -14,6 +14,7 @@
 package logpuller
 
 import (
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -42,6 +43,8 @@ var (
 	metricConsumeKVEventsCallbackDurationWakeSubscription  = metrics.SubscriptionClientConsumeKVEventsCallbackDuration.WithLabelValues("wakeSubscription")
 )
 
+var forceGC = runtime.GC
+
 const (
 	DataGroupEntriesOrResolvedTs = 1
 	DataGroupError               = 2
@@ -56,6 +59,7 @@ type regionEvent struct {
 
 	entries    *cdcpb.Event_Entries_
 	resolvedTs uint64
+	processed  chan struct{}
 }
 
 func (event *regionEvent) getSize() int {
@@ -84,6 +88,12 @@ func (event regionEvent) mustFirstState() *regionFeedState {
 		log.Panic("region event has empty states", zap.Any("event", event))
 	}
 	return event.states[0]
+}
+
+func (event regionEvent) markProcessed() {
+	if event.processed != nil {
+		close(event.processed)
+	}
 }
 
 type regionEventHandler struct {
@@ -121,7 +131,12 @@ func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent)
 	}
 
 	newResolvedTs := uint64(0)
+	processedEvents := make([]regionEvent, 0, len(events))
+	flushKVEventsCache := func() {
+		h.consumeKVEventsCache(span, nil, true)
+	}
 	for _, event := range events {
+		processedEvents = append(processedEvents, event)
 		if len(event.states) == 1 && event.states[0].isStale() {
 			hasError = true
 			h.handleRegionError(event.states[0])
@@ -129,7 +144,7 @@ func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent)
 		}
 		if event.entries != nil {
 			hasEntries = true
-			handleEventEntries(span, event.mustFirstState(), event.entries)
+			handleEventEntries(span, event.mustFirstState(), event.entries, flushKVEventsCache)
 		} else if event.resolvedTs != 0 {
 			hasResolved = true
 			for _, state := range event.states {
@@ -142,36 +157,93 @@ func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent)
 			log.Panic("should not reach", zap.Any("event", event), zap.Any("events", events))
 		}
 	}
+	markProcessed := func() {
+		for _, event := range processedEvents {
+			event.markProcessed()
+		}
+	}
 	tryAdvanceResolvedTs := func() {
 		if newResolvedTs != 0 {
 			span.advanceResolvedTs(newResolvedTs)
 		}
 	}
 	if len(span.kvEventsCache) > 0 {
-		metricsEventCount.Add(float64(len(span.kvEventsCache)))
-		await := span.consumeKVEvents(span.kvEventsCache, func() {
-			start := time.Now()
-			span.clearKVEventsCache()
-			metricConsumeKVEventsCallbackDurationClearCache.Observe(time.Since(start).Seconds())
-
-			start = time.Now()
+		return h.consumeKVEventsCache(span, func() {
 			tryAdvanceResolvedTs()
-			metricConsumeKVEventsCallbackDurationAdvanceResolvedTs.Observe(time.Since(start).Seconds())
-
-			start = time.Now()
-			h.subClient.wakeSubscription(span.subID)
-			metricConsumeKVEventsCallbackDurationWakeSubscription.Observe(time.Since(start).Seconds())
-		})
-		// if not await, the wake callback will not be called, we need clear the cache manually.
-		if !await {
-			span.clearKVEventsCache()
-			tryAdvanceResolvedTs()
-		}
-		return await
+			markProcessed()
+		}, false)
 	} else {
 		tryAdvanceResolvedTs()
+		markProcessed()
 	}
 	return false
+}
+
+func (h *regionEventHandler) consumeKVEventsCache(
+	span *subscribedSpan,
+	onFinish func(),
+	wait bool,
+) bool {
+	if len(span.kvEventsCache) == 0 {
+		return false
+	}
+	metricsEventCount.Add(float64(len(span.kvEventsCache)))
+	if wait {
+		done := make(chan struct{})
+		await := span.consumeKVEvents(span.kvEventsCache, func() {
+			close(done)
+		})
+		if await {
+			<-done
+		}
+		start := time.Now()
+		h.clearKVEventsCache(span, true)
+		metricConsumeKVEventsCallbackDurationClearCache.Observe(time.Since(start).Seconds())
+		if onFinish != nil {
+			onFinish()
+		}
+		return false
+	}
+
+	await := span.consumeKVEvents(span.kvEventsCache, func() {
+		start := time.Now()
+		h.clearKVEventsCache(span, true)
+		metricConsumeKVEventsCallbackDurationClearCache.Observe(time.Since(start).Seconds())
+
+		start = time.Now()
+		if onFinish != nil {
+			onFinish()
+		}
+		metricConsumeKVEventsCallbackDurationAdvanceResolvedTs.Observe(time.Since(start).Seconds())
+
+		start = time.Now()
+		h.subClient.wakeSubscription(span.subID)
+		metricConsumeKVEventsCallbackDurationWakeSubscription.Observe(time.Since(start).Seconds())
+	})
+	// if not await, the wake callback will not be called, we need clear the cache manually.
+	if !await {
+		start := time.Now()
+		h.clearKVEventsCache(span, true)
+		metricConsumeKVEventsCallbackDurationClearCache.Observe(time.Since(start).Seconds())
+		if onFinish != nil {
+			onFinish()
+		}
+	}
+	return await
+}
+
+func (h *regionEventHandler) clearKVEventsCache(span *subscribedSpan, maybeForceGC bool) {
+	releasedBytes := span.kvEventsCacheBytes
+	span.clearKVEventsCache()
+	if !maybeForceGC || kvEventsCacheGCThresholdInBytes <= 0 || releasedBytes <= 0 {
+		return
+	}
+	span.kvEventsCacheReleasedBytesSinceGC += releasedBytes
+	if span.kvEventsCacheReleasedBytesSinceGC < kvEventsCacheGCThresholdInBytes {
+		return
+	}
+	span.kvEventsCacheReleasedBytesSinceGC = 0
+	forceGC()
 }
 
 func (h *regionEventHandler) GetSize(event regionEvent) int {
@@ -226,6 +298,7 @@ func (h *regionEventHandler) GetType(event regionEvent) dynstream.EventType {
 }
 
 func (h *regionEventHandler) OnDrop(event regionEvent) interface{} {
+	event.markProcessed()
 	// TODO: Distinguish between drop events caused by "path not found" errors and memory control.
 	state := event.mustFirstState()
 	fields := []zap.Field{
@@ -259,7 +332,12 @@ func (h *regionEventHandler) handleRegionError(state *regionFeedState) {
 	}
 }
 
-func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *cdcpb.Event_Entries_) {
+func handleEventEntries(
+	span *subscribedSpan,
+	state *regionFeedState,
+	entries *cdcpb.Event_Entries_,
+	flushKVEventsCache func(),
+) {
 	regionID, _, _ := state.getRegionMeta()
 	assembleRowEvent := func(regionID uint64, entry *cdcpb.Event_Row) common.RawKVEntry {
 		var opType common.OpType
@@ -281,6 +359,11 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 			OldValue: entry.GetOldValue(),
 		}
 	}
+	appendRowEvent := func(entry *cdcpb.Event_Row) {
+		appendKVEventAndMaybeFlush(span, assembleRowEvent(regionID, entry), flushKVEventsCache)
+		entry.Value = nil
+		entry.OldValue = nil
+	}
 
 	for _, entry := range entries.Entries.GetEntries() {
 		switch entry.Type {
@@ -298,7 +381,7 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 					return row.GetCommitTs() > span.startTs
 				},
 			) {
-				span.kvEventsCache = append(span.kvEventsCache, assembleRowEvent(regionID, cachedEvent))
+				appendRowEvent(cachedEvent)
 			}
 			state.matcher.matchCachedRollbackRow(true)
 		case cdcpb.Event_COMMITTED:
@@ -313,9 +396,11 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 					zap.Uint64("resolvedTs", resolvedTs),
 					zap.String("key", util.RedactKey(entry.GetKey())))
 			}
-			span.kvEventsCache = append(span.kvEventsCache, assembleRowEvent(regionID, entry))
+			appendRowEvent(entry)
 		case cdcpb.Event_PREWRITE:
 			state.matcher.putPrewriteRow(entry)
+			entry.Value = nil
+			entry.OldValue = nil
 		case cdcpb.Event_COMMIT:
 			// NOTE: matchRow should always be called even if the event is stale.
 			isStaleEvent := entry.CommitTs <= span.startTs
@@ -356,7 +441,7 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 					zap.Uint64("resolvedTs", resolvedTs),
 					zap.String("key", util.RedactKey(entry.GetKey())))
 			}
-			span.kvEventsCache = append(span.kvEventsCache, assembleRowEvent(regionID, entry))
+			appendRowEvent(entry)
 		case cdcpb.Event_ROLLBACK:
 			if !state.isInitialized() {
 				state.matcher.cacheRollbackRow(entry)
@@ -364,6 +449,17 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 			}
 			state.matcher.rollbackRow(entry)
 		}
+	}
+}
+
+func appendKVEventAndMaybeFlush(
+	span *subscribedSpan,
+	event common.RawKVEntry,
+	flushKVEventsCache func(),
+) {
+	span.appendKVEvent(event)
+	if span.shouldFlushKVEventsCache() {
+		flushKVEventsCache()
 	}
 }
 
