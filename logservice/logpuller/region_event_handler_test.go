@@ -70,7 +70,7 @@ func TestHandleEventEntryEventOutOfOrder(t *testing.T) {
 	subSpan := &subscribedSpan{
 		subID:             subID,
 		span:              span,
-		startTs:           1000, // not used
+		startTs:           0,
 		consumeKVEvents:   consumeKVEvents,
 		advanceResolvedTs: advanceResolvedTs,
 		advanceInterval:   0,
@@ -201,6 +201,110 @@ func TestHandleEventEntryEventOutOfOrder(t *testing.T) {
 			require.True(t, false, "must get an event")
 		}
 	}
+}
+
+func TestHandleEventEntriesSkipsStaleCommitValue(t *testing.T) {
+	span := heartbeatpb.TableSpan{
+		TableID:  100,
+		StartKey: common.ToComparableKey([]byte{}),
+		EndKey:   common.ToComparableKey(common.UpperBoundKey),
+	}
+	subSpan := &subscribedSpan{
+		subID:   SubscriptionID(1),
+		span:    span,
+		startTs: 10,
+	}
+	region := newRegionInfo(
+		tikv.NewRegionVerID(1, 1, 1),
+		span,
+		&tikv.RPCContext{},
+		subSpan,
+		false,
+	)
+	region.lockedRangeState = &regionlock.LockedRangeState{}
+	region.lockedRangeState.Initialized.Store(true)
+	state := newRegionFeedState(region, uint64(subSpan.subID), &regionRequestWorker{requestCache: &requestCache{}})
+	state.start()
+
+	commit := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 10,
+		Type:     cdcpb.Event_COMMIT,
+		OpType:   cdcpb.Event_Row_PUT,
+		Key:      []byte("key"),
+	}
+	handleEventEntries(subSpan, state, &cdcpb.Event_Entries_{
+		Entries: &cdcpb.Event_Entries{
+			Entries: []*cdcpb.Event_Row{
+				{
+					StartTs: 1,
+					Type:    cdcpb.Event_PREWRITE,
+					OpType:  cdcpb.Event_Row_PUT,
+					Key:     []byte("key"),
+					Value:   []byte("value"),
+				},
+				commit,
+			},
+		},
+	})
+
+	require.Empty(t, subSpan.kvEventsCache)
+	require.Nil(t, commit.Value)
+	require.Nil(t, commit.OldValue)
+	require.Empty(t, state.matcher.unmatchedValue)
+}
+
+func TestHandleEventEntriesSkipsCachedStaleCommitAfterInitialized(t *testing.T) {
+	span := heartbeatpb.TableSpan{
+		TableID:  100,
+		StartKey: common.ToComparableKey([]byte{}),
+		EndKey:   common.ToComparableKey(common.UpperBoundKey),
+	}
+	subSpan := &subscribedSpan{
+		subID:   SubscriptionID(1),
+		span:    span,
+		startTs: 10,
+	}
+	region := newRegionInfo(
+		tikv.NewRegionVerID(1, 1, 1),
+		span,
+		&tikv.RPCContext{},
+		subSpan,
+		false,
+	)
+	region.lockedRangeState = &regionlock.LockedRangeState{}
+	state := newRegionFeedState(region, uint64(subSpan.subID), &regionRequestWorker{requestCache: &requestCache{}})
+	state.start()
+
+	commit := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 10,
+		Type:     cdcpb.Event_COMMIT,
+		OpType:   cdcpb.Event_Row_PUT,
+		Key:      []byte("key"),
+	}
+	handleEventEntries(subSpan, state, &cdcpb.Event_Entries_{
+		Entries: &cdcpb.Event_Entries{Entries: []*cdcpb.Event_Row{commit}},
+	})
+	handleEventEntries(subSpan, state, &cdcpb.Event_Entries_{
+		Entries: &cdcpb.Event_Entries{
+			Entries: []*cdcpb.Event_Row{
+				{
+					StartTs: 1,
+					Type:    cdcpb.Event_PREWRITE,
+					OpType:  cdcpb.Event_Row_PUT,
+					Key:     []byte("key"),
+					Value:   []byte("value"),
+				},
+				{Type: cdcpb.Event_INITIALIZED},
+			},
+		},
+	})
+
+	require.Empty(t, subSpan.kvEventsCache)
+	require.Nil(t, commit.Value)
+	require.Nil(t, commit.OldValue)
+	require.Empty(t, state.matcher.unmatchedValue)
 }
 
 func TestHandleResolvedTs(t *testing.T) {

@@ -292,7 +292,12 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 				zap.Uint64("requestID", state.requestID),
 				zap.String("startKey", spanz.HexKey(span.span.StartKey)),
 				zap.String("endKey", spanz.HexKey(span.span.EndKey)))
-			for _, cachedEvent := range state.matcher.matchCachedRow(true) {
+			for _, cachedEvent := range state.matcher.matchCachedRowWithFilter(
+				true,
+				func(row *cdcpb.Event_Row) bool {
+					return row.GetCommitTs() > span.startTs
+				},
+			) {
 				span.kvEventsCache = append(span.kvEventsCache, assembleRowEvent(regionID, cachedEvent))
 			}
 			state.matcher.matchCachedRollbackRow(true)
@@ -313,7 +318,14 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 			state.matcher.putPrewriteRow(entry)
 		case cdcpb.Event_COMMIT:
 			// NOTE: matchRow should always be called even if the event is stale.
-			if !state.matcher.matchRow(entry, state.isInitialized()) {
+			isStaleEvent := entry.CommitTs <= span.startTs
+			matched := false
+			if isStaleEvent {
+				matched = state.matcher.matchRowWithoutValue(entry, state.isInitialized())
+			} else {
+				matched = state.matcher.matchRow(entry, state.isInitialized())
+			}
+			if !matched {
 				if !state.isInitialized() {
 					state.matcher.cacheCommitRow(entry)
 					continue
@@ -328,7 +340,6 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 			}
 
 			// TiKV can send events with StartTs/CommitTs less than startTs.
-			isStaleEvent := entry.CommitTs <= span.startTs
 			if isStaleEvent {
 				continue
 			}

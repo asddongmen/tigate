@@ -101,6 +101,27 @@ func TestMatchFakePrewrite(t *testing.T) {
 	require.True(t, ok)
 }
 
+func TestMatchRowWithoutValue(t *testing.T) {
+	t.Parallel()
+	matcher := newMatcher()
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs:  1,
+		Key:      []byte("k1"),
+		Value:    []byte("v1"),
+		OldValue: []byte("ov1"),
+	})
+
+	commitRow := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 2,
+		Key:      []byte("k1"),
+	}
+	require.True(t, matcher.matchRowWithoutValue(commitRow, true))
+	require.Nil(t, commitRow.Value)
+	require.Nil(t, commitRow.OldValue)
+	require.Empty(t, matcher.unmatchedValue)
+}
+
 func TestMatchRowUninitialized(t *testing.T) {
 	t.Parallel()
 	matcher := newMatcher()
@@ -236,6 +257,31 @@ func TestMatchMatchCachedRow(t *testing.T) {
 		Value:    []byte("v2"),
 		OldValue: []byte("ov2"),
 	}}, matcher.matchCachedRow(true))
+}
+
+func TestMatchCachedRowWithFilterDoesNotFillSkippedRows(t *testing.T) {
+	t.Parallel()
+	matcher := newMatcher()
+	cachedCommit := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 2,
+		Key:      []byte("k1"),
+	}
+	matcher.cacheCommitRow(cachedCommit)
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs:  1,
+		Key:      []byte("k1"),
+		Value:    []byte("v1"),
+		OldValue: []byte("ov1"),
+	})
+
+	rows := matcher.matchCachedRowWithFilter(true, func(row *cdcpb.Event_Row) bool {
+		return row.GetCommitTs() > 2
+	})
+	require.Empty(t, rows)
+	require.Nil(t, cachedCommit.Value)
+	require.Nil(t, cachedCommit.OldValue)
+	require.Empty(t, matcher.unmatchedValue)
 }
 
 func TestMatchMatchCachedRollbackRow(t *testing.T) {

@@ -87,25 +87,39 @@ func (m *matcher) putPrewriteRow(row *cdcpb.Event_Row) {
 // matchRow matches the commit event with the cached prewrite event
 // the Value and OldValue will be assigned if a matched prewrite event exists.
 func (m *matcher) matchRow(row *cdcpb.Event_Row, initialized bool) bool {
-	if value, exist := m.unmatchedValue[newMatchKey(row)]; exist {
+	value, exist := m.popPrewriteRow(row, initialized)
+	if !exist {
+		return false
+	}
+	row.Value = value.GetValue()
+	row.OldValue = value.GetOldValue()
+	return true
+}
+
+func (m *matcher) matchRowWithoutValue(row *cdcpb.Event_Row, initialized bool) bool {
+	_, exist := m.popPrewriteRow(row, initialized)
+	return exist
+}
+
+func (m *matcher) popPrewriteRow(row *cdcpb.Event_Row, initialized bool) (*cdcpb.Event_Row, bool) {
+	key := newMatchKey(row)
+	if value, exist := m.unmatchedValue[key]; exist {
 		// TiKV may send a fake prewrite event with empty value caused by txn heartbeat.
 		//
 		// We need to skip match if the region is not initialized,
 		// as prewrite events may be sent out of order.
 		if !initialized && len(value.GetValue()) == 0 {
-			return false
+			return nil, false
 		}
 		// Pipelined-DML transactions can only be matched after initialized.
 		if !initialized && value.Generation > 0 {
-			return false
+			return nil, false
 		}
-		row.Value = value.GetValue()
-		row.OldValue = value.GetOldValue()
-		delete(m.unmatchedValue, newMatchKey(row))
+		delete(m.unmatchedValue, key)
 		prewriteCacheRowNum.Dec()
-		return true
+		return value, true
 	}
-	return false
+	return nil, false
 }
 
 func (m *matcher) cacheCommitRow(row *cdcpb.Event_Row) {
@@ -114,6 +128,13 @@ func (m *matcher) cacheCommitRow(row *cdcpb.Event_Row) {
 
 //nolint:unparam
 func (m *matcher) matchCachedRow(initialized bool) []*cdcpb.Event_Row {
+	return m.matchCachedRowWithFilter(initialized, nil)
+}
+
+func (m *matcher) matchCachedRowWithFilter(
+	initialized bool,
+	shouldEmit func(row *cdcpb.Event_Row) bool,
+) []*cdcpb.Event_Row {
 	if !initialized {
 		log.Panic("must be initialized before match cached rows")
 	}
@@ -122,7 +143,13 @@ func (m *matcher) matchCachedRow(initialized bool) []*cdcpb.Event_Row {
 	top := 0
 	for i := 0; i < len(cachedCommit); i++ {
 		cacheEntry := cachedCommit[i]
-		ok := m.matchRow(cacheEntry, true)
+		emit := shouldEmit == nil || shouldEmit(cacheEntry)
+		ok := false
+		if emit {
+			ok = m.matchRow(cacheEntry, true)
+		} else {
+			ok = m.matchRowWithoutValue(cacheEntry, true)
+		}
 		if !ok {
 			// when cdc receives a commit log without a corresponding
 			// prewrite log before initialized, a committed log  with
@@ -130,6 +157,9 @@ func (m *matcher) matchCachedRow(initialized bool) []*cdcpb.Event_Row {
 			log.Info("ignore commit event without prewrite",
 				zap.String("key", util.RedactKey(cacheEntry.GetKey())),
 				zap.Uint64("startTs", cacheEntry.GetStartTs()))
+			continue
+		}
+		if !emit {
 			continue
 		}
 		cachedCommit[top] = cacheEntry
