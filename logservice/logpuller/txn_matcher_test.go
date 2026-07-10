@@ -14,10 +14,12 @@
 package logpuller
 
 import (
+	"os"
 	"testing"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/cdcpb"
+	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -99,6 +101,145 @@ func TestMatchFakePrewrite(t *testing.T) {
 		OldValue: []byte("v3"),
 	}, commitRow1)
 	require.True(t, ok)
+}
+
+func TestMatchRowWithoutValue(t *testing.T) {
+	t.Parallel()
+	matcher := newMatcher()
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs:  1,
+		Key:      []byte("k1"),
+		Value:    []byte("v1"),
+		OldValue: []byte("ov1"),
+	})
+
+	commitRow := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 2,
+		Key:      []byte("k1"),
+	}
+	require.True(t, matcher.matchRowWithoutValue(commitRow, true))
+	require.Nil(t, commitRow.Value)
+	require.Nil(t, commitRow.OldValue)
+	require.Empty(t, matcher.unmatchedValue)
+}
+
+func TestMatcherSpillsPrewriteRowsOverThreshold(t *testing.T) {
+	withPrewriteSpillTestConfig(t, 1)
+
+	matcher := newMatcher()
+	prewrite := &cdcpb.Event_Row{
+		StartTs:  1,
+		Key:      []byte("k1"),
+		Value:    []byte("v1"),
+		OldValue: []byte("ov1"),
+	}
+	matcher.putPrewriteRow(prewrite)
+
+	require.Nil(t, prewrite.Key)
+	require.Nil(t, prewrite.Value)
+	require.Nil(t, prewrite.OldValue)
+	stored := matcher.unmatchedValue[newMatchKey(&cdcpb.Event_Row{StartTs: 1, Key: []byte("k1")})]
+	require.True(t, stored.isSpilled())
+	require.Nil(t, stored.key)
+	require.Zero(t, matcher.inMemoryValueBytes)
+	require.Equal(t, 1, matcher.spilledPrewriteNum)
+	spillPath := matcher.spillFile.Path()
+
+	commitRow := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 2,
+		Key:      []byte("k1"),
+	}
+	require.True(t, matcher.matchRow(commitRow, true))
+	require.Equal(t, []byte("v1"), commitRow.Value)
+	require.Equal(t, []byte("ov1"), commitRow.OldValue)
+	require.Empty(t, matcher.unmatchedValue)
+	require.Zero(t, matcher.spilledPrewriteNum)
+	require.Nil(t, matcher.spillFile)
+
+	_, err := os.Stat(spillPath)
+	require.True(t, os.IsNotExist(err))
+}
+
+func TestMatcherSpillsSmallRowsAfterMemoryThreshold(t *testing.T) {
+	withPrewriteSpillTestConfig(t, 5)
+
+	matcher := newMatcher()
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs: 1,
+		Key:     []byte("k1"),
+		Value:   []byte("aa"),
+	})
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs: 2,
+		Key:     []byte("k2"),
+		Value:   []byte("bb"),
+	})
+
+	stored1 := matcher.unmatchedValue[newMatchKey(&cdcpb.Event_Row{StartTs: 1, Key: []byte("k1")})]
+	stored2 := matcher.unmatchedValue[newMatchKey(&cdcpb.Event_Row{StartTs: 2, Key: []byte("k2")})]
+	require.False(t, stored1.isSpilled())
+	require.True(t, stored2.isSpilled())
+	require.Equal(t, int64(4), matcher.inMemoryValueBytes)
+
+	commitRow1 := &cdcpb.Event_Row{StartTs: 1, CommitTs: 3, Key: []byte("k1")}
+	require.True(t, matcher.matchRow(commitRow1, true))
+	require.Equal(t, []byte("aa"), commitRow1.Value)
+	require.Zero(t, matcher.inMemoryValueBytes)
+	require.NotNil(t, matcher.spillFile)
+
+	commitRow2 := &cdcpb.Event_Row{StartTs: 2, CommitTs: 4, Key: []byte("k2")}
+	require.True(t, matcher.matchRow(commitRow2, true))
+	require.Equal(t, []byte("bb"), commitRow2.Value)
+	require.Nil(t, matcher.spillFile)
+}
+
+func TestMatcherStaleCommitDoesNotReadSpilledValue(t *testing.T) {
+	withPrewriteSpillTestConfig(t, 1)
+
+	matcher := newMatcher()
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs:  1,
+		Key:      []byte("k1"),
+		Value:    []byte("v1"),
+		OldValue: []byte("ov1"),
+	})
+	spillPath := matcher.spillFile.Path()
+
+	commitRow := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 2,
+		Key:      []byte("k1"),
+	}
+	require.True(t, matcher.matchRowWithoutValue(commitRow, true))
+	require.Nil(t, commitRow.Value)
+	require.Nil(t, commitRow.OldValue)
+	require.Empty(t, matcher.unmatchedValue)
+	require.Nil(t, matcher.spillFile)
+
+	_, err := os.Stat(spillPath)
+	require.True(t, os.IsNotExist(err))
+}
+
+func TestMatcherRollbackCleansSpilledPrewrite(t *testing.T) {
+	withPrewriteSpillTestConfig(t, 1)
+
+	matcher := newMatcher()
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs: 1,
+		Key:     []byte("k1"),
+		Value:   []byte("v1"),
+	})
+	spillPath := matcher.spillFile.Path()
+
+	matcher.rollbackRow(&cdcpb.Event_Row{StartTs: 1, Key: []byte("k1")})
+	require.Empty(t, matcher.unmatchedValue)
+	require.Zero(t, matcher.spilledPrewriteNum)
+	require.Nil(t, matcher.spillFile)
+
+	_, err := os.Stat(spillPath)
+	require.True(t, os.IsNotExist(err))
 }
 
 func TestMatchRowUninitialized(t *testing.T) {
@@ -238,6 +379,31 @@ func TestMatchMatchCachedRow(t *testing.T) {
 	}}, matcher.matchCachedRow(true))
 }
 
+func TestMatchCachedRowWithFilterDoesNotFillSkippedRows(t *testing.T) {
+	t.Parallel()
+	matcher := newMatcher()
+	cachedCommit := &cdcpb.Event_Row{
+		StartTs:  1,
+		CommitTs: 2,
+		Key:      []byte("k1"),
+	}
+	matcher.cacheCommitRow(cachedCommit)
+	matcher.putPrewriteRow(&cdcpb.Event_Row{
+		StartTs:  1,
+		Key:      []byte("k1"),
+		Value:    []byte("v1"),
+		OldValue: []byte("ov1"),
+	})
+
+	rows := matcher.matchCachedRowWithFilter(true, func(row *cdcpb.Event_Row) bool {
+		return row.GetCommitTs() > 2
+	})
+	require.Empty(t, rows)
+	require.Nil(t, cachedCommit.Value)
+	require.Nil(t, cachedCommit.OldValue)
+	require.Empty(t, matcher.unmatchedValue)
+}
+
 func TestMatchMatchCachedRollbackRow(t *testing.T) {
 	t.Parallel()
 	matcher := newMatcher()
@@ -324,7 +490,7 @@ func TestMatcher_TryCleanUnmatchedValue(t *testing.T) {
 			setupMatcher: func() *matcher {
 				m := newMatcher()
 				m.lastPrewriteTime = time.Now()
-				m.unmatchedValue[matchKey{startTs: 1, key: "test"}] = &cdcpb.Event_Row{}
+				m.unmatchedValue[newMatchKey(&cdcpb.Event_Row{StartTs: 1, Key: []byte("test")})] = prewriteRow{}
 				return m
 			},
 			wait:       6 * time.Second,
@@ -392,4 +558,21 @@ func TestMatchPipelinedDMLs(t *testing.T) {
 	rows := matcher.matchCachedRow(true)
 	require.Equal(t, 1, len(rows))
 	require.Equal(t, rows[0].Value, []byte("v4"))
+}
+
+func withPrewriteSpillTestConfig(t *testing.T, threshold int64) {
+	t.Helper()
+
+	oldThreshold := prewriteSpillMemoryThresholdInBytes
+	prewriteSpillMemoryThresholdInBytes = threshold
+
+	originalConfig := config.GetGlobalServerConfig().Clone()
+	cfg := originalConfig.Clone()
+	cfg.DataDir = t.TempDir()
+	config.StoreGlobalServerConfig(cfg)
+
+	t.Cleanup(func() {
+		prewriteSpillMemoryThresholdInBytes = oldThreshold
+		config.StoreGlobalServerConfig(originalConfig)
+	})
 }
