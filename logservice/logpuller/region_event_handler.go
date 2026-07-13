@@ -19,7 +19,6 @@ import (
 
 	"github.com/pingcap/kvproto/pkg/cdcpb"
 	"github.com/pingcap/log"
-	"github.com/pingcap/ticdc/logservice/logpuller/regionlock"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	"github.com/pingcap/ticdc/pkg/spanz"
@@ -134,28 +133,10 @@ func (h *regionEventHandler) Handle(span *subscribedSpan, events ...regionEvent)
 			handleEventEntries(span, event.mustFirstState(), event.entries)
 		} else if event.resolvedTs != 0 {
 			hasResolved = true
-			if span.advanceInterval == 0 {
-				updatedStates := make([]*regionlock.LockedRangeState, 0, len(event.states))
-				regionID := uint64(0)
-				for _, state := range event.states {
-					if updateRegionResolvedTs(state, event.resolvedTs) {
-						updatedStates = append(updatedStates, state.region.lockedRangeState)
-						regionID = state.getRegionID()
-					}
-				}
-				if len(updatedStates) > 0 {
-					ts := span.rangeLock.UpdateLockedRangeStateHeapBatch(updatedStates)
-					resolvedTs := advanceSpanResolvedTs(span, regionID, ts)
-					if resolvedTs > newResolvedTs {
-						newResolvedTs = resolvedTs
-					}
-				}
-			} else {
-				for _, state := range event.states {
-					resolvedTs := handleResolvedTs(span, state, event.resolvedTs)
-					if resolvedTs > newResolvedTs {
-						newResolvedTs = resolvedTs
-					}
+			for _, state := range event.states {
+				resolvedTs := handleResolvedTs(span, state, event.resolvedTs)
+				if resolvedTs > newResolvedTs {
+					newResolvedTs = resolvedTs
 				}
 			}
 		} else {
@@ -377,17 +358,30 @@ func handleEventEntries(span *subscribedSpan, state *regionFeedState, entries *c
 }
 
 func handleResolvedTs(span *subscribedSpan, state *regionFeedState, resolvedTs uint64) uint64 {
-	if !updateRegionResolvedTs(state, resolvedTs) {
+	if state.isStale() || !state.isInitialized() {
+		return 0
+	}
+	state.matcher.tryCleanUnmatchedValue()
+	regionID := state.getRegionID()
+	lastResolvedTs := state.getLastResolvedTs()
+	if resolvedTs < lastResolvedTs {
+		log.Debug("The resolvedTs is fallen back in subscription client",
+			zap.Uint64("subscriptionID", uint64(state.region.subscribedSpan.subID)),
+			zap.Uint64("regionID", regionID),
+			zap.Uint64("resolvedTs", resolvedTs),
+			zap.Uint64("lastResolvedTs", lastResolvedTs))
 		return 0
 	}
 
-	regionID := state.getRegionID()
+	state.updateResolvedTs(resolvedTs)
+
 	ts := uint64(0)
 	shouldAdvance := false
 	// advanceInterval defaults to 100ms; setting it to 0 means resolving the timestamp as soon as possible.
 	// Note: If a single span contains an extremely large number of regions (e.g., 500k), advanceInterval = 0 may cause performance issues.
 	if span.advanceInterval == 0 {
-		ts = span.rangeLock.UpdateLockedRangeStateHeapBatch([]*regionlock.LockedRangeState{state.region.lockedRangeState})
+		span.rangeLock.UpdateLockedRangeStateHeap(state.region.lockedRangeState)
+		ts = span.rangeLock.GetHeapMinTs()
 		shouldAdvance = true
 	} else {
 		now := time.Now().UnixMilli()
@@ -399,60 +393,37 @@ func handleResolvedTs(span *subscribedSpan, state *regionFeedState, resolvedTs u
 	}
 
 	if shouldAdvance {
-		return advanceSpanResolvedTs(span, regionID, ts)
-	}
-	return 0
-}
-
-func updateRegionResolvedTs(state *regionFeedState, resolvedTs uint64) bool {
-	if state.isStale() || !state.isInitialized() {
-		return false
-	}
-	state.matcher.tryCleanUnmatchedValue()
-	lastResolvedTs := state.getLastResolvedTs()
-	if resolvedTs < lastResolvedTs {
-		log.Debug("The resolvedTs is fallen back in subscription client",
-			zap.Uint64("subscriptionID", uint64(state.region.subscribedSpan.subID)),
-			zap.Uint64("regionID", state.getRegionID()),
-			zap.Uint64("resolvedTs", resolvedTs),
-			zap.Uint64("lastResolvedTs", lastResolvedTs))
-		return false
-	}
-
-	state.updateResolvedTs(resolvedTs)
-	return true
-}
-
-func advanceSpanResolvedTs(span *subscribedSpan, regionID uint64, ts uint64) uint64 {
-	if ts > 0 && span.initialized.CompareAndSwap(false, true) {
-		log.Info("subscription client is initialized",
-			zap.Uint64("subscriptionID", uint64(span.subID)),
-			zap.Uint64("regionID", regionID),
-			zap.Uint64("resolvedTs", ts))
-	}
-	lastResolvedTs := span.resolvedTs.Load()
-	nextResolvedPhyTs := oracle.ExtractPhysical(ts)
-	// Generally, we don't want to send duplicate resolved ts,
-	// so we check whether `ts` is larger than `lastResolvedTs` before send it.
-	// but when `ts` == `lastResolvedTs` == `span.startTs`,
-	// the span may just be initialized and have not receive any resolved ts before,
-	// so we also send ts in this case for quick notification to downstream.
-	if ts > lastResolvedTs || (ts == lastResolvedTs && lastResolvedTs == span.startTs) {
-		resolvedPhyTs := oracle.ExtractPhysical(lastResolvedTs)
-		decreaseLag := float64(nextResolvedPhyTs-resolvedPhyTs) / 1e3
-		const largeResolvedTsAdvanceStepInSecs = 30
-		if decreaseLag > largeResolvedTsAdvanceStepInSecs {
-			log.Warn("resolved ts advance step is too large",
-				zap.Uint64("subID", uint64(span.subID)),
-				zap.Int64("tableID", span.span.TableID),
+		if ts > 0 && span.initialized.CompareAndSwap(false, true) {
+			log.Info("subscription client is initialized",
+				zap.Uint64("subscriptionID", uint64(span.subID)),
 				zap.Uint64("regionID", regionID),
-				zap.Uint64("resolvedTs", ts),
-				zap.Uint64("lastResolvedTs", lastResolvedTs),
-				zap.Float64("decreaseLag(s)", decreaseLag))
+				zap.Uint64("resolvedTs", ts))
 		}
-		span.resolvedTs.Store(ts)
-		span.resolvedTsUpdated.Store(time.Now().Unix())
-		return ts
+		lastResolvedTs := span.resolvedTs.Load()
+		nextResolvedPhyTs := oracle.ExtractPhysical(ts)
+		// Generally, we don't want to send duplicate resolved ts,
+		// so we check whether `ts` is larger than `lastResolvedTs` before send it.
+		// but when `ts` == `lastResolvedTs` == `span.startTs`,
+		// the span may just be initialized and have not receive any resolved ts before,
+		// so we also send ts in this case for quick notification to downstream.
+		if ts > lastResolvedTs || (ts == lastResolvedTs && lastResolvedTs == span.startTs) {
+			resolvedPhyTs := oracle.ExtractPhysical(lastResolvedTs)
+			decreaseLag := float64(nextResolvedPhyTs-resolvedPhyTs) / 1e3
+			const largeResolvedTsAdvanceStepInSecs = 30
+			if decreaseLag > largeResolvedTsAdvanceStepInSecs {
+				log.Warn("resolved ts advance step is too large",
+					zap.Uint64("subID", uint64(span.subID)),
+					zap.Int64("tableID", span.span.TableID),
+					zap.Uint64("regionID", regionID),
+					zap.Uint64("resolvedTs", ts),
+					zap.Uint64("lastResolvedTs", lastResolvedTs),
+					zap.Float64("decreaseLag(s)", decreaseLag))
+			}
+			span.resolvedTs.Store(ts)
+			span.resolvedTsUpdated.Store(time.Now().Unix())
+			return ts
+		}
 	}
+
 	return 0
 }
