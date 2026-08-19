@@ -760,6 +760,38 @@ func TestScanRangeCappedByScanWindow(t *testing.T) {
 	require.Equal(t, oracle.GoTimeToTS(baseTime.Add(defaultScanInterval)), result.request.Range.CommitTsEnd)
 }
 
+func TestIdleDispatcherBypassesScanWindow(t *testing.T) {
+	broker, _, schemaStore, _ := newEventBrokerForTest()
+	broker.close()
+	schemaStore.maxDDLCommitTs = 0
+
+	info := newMockDispatcherInfoForTest(t)
+	info.epoch = 1
+	baseTime := time.Now()
+	baseTs := oracle.GoTimeToTS(baseTime)
+	receivedTs := oracle.GoTimeToTS(baseTime.Add(20 * time.Second))
+	info.startTs = baseTs
+
+	status := newChangefeedStatusWithScanWindow(info.GetChangefeedID(), 0, true)
+	disp := newDispatcherStat(info, 1, 1, nil, status)
+	disp.seq.Store(1)
+	disp.receivedResolvedTs.Store(receivedTs)
+	disp.eventStoreCommitTs.Store(baseTs - 1)
+	dispPtr := &atomic.Pointer[dispatcherStat]{}
+	dispPtr.Store(disp)
+	status.addDispatcher(disp.id, dispPtr)
+	status.refreshMinSentResolvedTs()
+
+	result := broker.getScanTaskRequestResult(disp)
+	require.False(t, result.needScan)
+	require.Equal(t, receivedTs, disp.sentResolvedTs.Load())
+
+	resolved := <-broker.messageCh[disp.messageWorkerIndex]
+	require.Equal(t, event.TypeResolvedEvent, resolved.msgType)
+	require.Equal(t, receivedTs, resolved.resolvedTsEvent.GetCommitTs())
+	require.Empty(t, broker.messageCh[disp.messageWorkerIndex])
+}
+
 func TestScanWindowCatchUpSchedulesEachAdvancedWindow(t *testing.T) {
 	broker, _, _, _ := newEventBrokerForTest()
 	broker.close()

@@ -608,8 +608,12 @@ func (c *eventBroker) getScanTaskRequestResult(task scanTask) scanTaskRequestRes
 	noDDLEvent := dataRange.CommitTsStart >= ddlState.MaxEventCommitTs
 	if noDMLEvent && noDDLEvent {
 		// The dispatcher has no new events. In such case, we don't need to scan the event store.
-		// We just send the watermark to the dispatcher.
-		c.sendResolvedTs(task, dataRange.CommitTsEnd)
+		// The scan window bounds event scans, not idle resolved-ts progress. Sending
+		// only the capped end here can make an idle dispatcher advance no faster
+		// than a small emergency window and permanently pin the shared window base.
+		// The EventStore and SchemaStore frontiers prove the whole pre-window range
+		// is empty, so it is safe to send that resolved boundary directly.
+		c.sendResolvedTs(task, commitTsEndBeforeWindow)
 		return result
 	}
 	result.needScan = true
