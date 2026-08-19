@@ -98,6 +98,10 @@ type fileWorkerGroup struct {
 	pool    sync.Pool
 	files   []*fileCache
 	flushCh chan *fileCache
+	// callbackCh preserves file creation order while uploads finish in parallel.
+	// Keeping callback waits off bgWriteLogs lets it continue assembling files
+	// while object storage is slow.
+	callbackCh chan *fileCache
 
 	metricWriteBytes       prometheus.Gauge
 	metricFlushAllDuration prometheus.Observer
@@ -141,7 +145,8 @@ func newFileWorkerGroup(
 				return &buf
 			},
 		},
-		flushCh: make(chan *fileCache, 32),
+		flushCh:    make(chan *fileCache, 32),
+		callbackCh: make(chan *fileCache, 32),
 		metricWriteBytes: metrics.RedoWriteBytesGauge.
 			WithLabelValues(cfg.ChangeFeedID().Keyspace(), cfg.ChangeFeedID().Name(), redo.RedoRowLogFileType),
 		metricFlushAllDuration: metrics.RedoFlushAllDurationHistogram.
@@ -169,11 +174,45 @@ func (f *fileWorkerGroup) Run(
 			return f.bgFlushFileCache(egCtx)
 		})
 	}
+	eg.Go(func() error {
+		return f.bgReleaseFileCallbacks(egCtx)
+	})
 	log.Info("redo file workers started",
 		zap.String("keyspace", f.cfg.ChangeFeedID().Keyspace()),
 		zap.String("changefeed", f.cfg.ChangeFeedID().Name()),
 		zap.Int("workerNum", f.workerNum))
 	return eg.Wait()
+}
+
+func (f *fileWorkerGroup) bgReleaseFileCallbacks(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.Trace(ctx.Err())
+		case file := <-f.callbackCh:
+			if err := file.waitFlushed(ctx); err != nil {
+				return errors.Trace(err)
+			}
+			for _, callback := range file.postFlush {
+				callback()
+			}
+			file.postFlush = nil
+		}
+	}
+}
+
+func (f *fileWorkerGroup) enqueueFile(ctx context.Context, file *fileCache) error {
+	select {
+	case <-ctx.Done():
+		return errors.Trace(ctx.Err())
+	case f.flushCh <- file:
+	}
+	select {
+	case <-ctx.Done():
+		return errors.Trace(ctx.Err())
+	case f.callbackCh <- file:
+		return nil
+	}
 }
 
 func (f *fileWorkerGroup) close() {
@@ -335,16 +374,14 @@ func (f *fileWorkerGroup) writeToCache(
 
 	file := f.files[len(f.files)-1]
 	if file.fileSize+writeLen > f.cfg.MaxLogSizeInBytes() {
-		select {
-		case <-egCtx.Done():
-			return errors.Trace(egCtx.Err())
-		case f.flushCh <- file:
+		if err := f.enqueueFile(egCtx, file); err != nil {
+			return err
 		}
 		file := f.newFileCache(data, commitTs, event.PostFlush)
 		if file == nil {
 			return errors.ErrRedoWriterStopped.FastGenByArgs("failed to create file cache")
 		}
-		f.files = append(f.files, file)
+		f.files[len(f.files)-1] = file
 		return nil
 	}
 
@@ -369,24 +406,10 @@ func (f *fileWorkerGroup) flushAll(egCtx context.Context) error {
 		return nil
 	}
 
-	file := f.files[len(f.files)-1]
-	select {
-	case <-egCtx.Done():
-		return errors.Trace(egCtx.Err())
-	case f.flushCh <- file:
-	}
-
-	// Wait in file creation order and release each durable prefix immediately.
-	// Uploads still run concurrently in the flush workers.
 	for _, file := range f.files {
-		err := file.waitFlushed(egCtx)
-		if err != nil {
-			return errors.Trace(err)
+		if err := f.enqueueFile(egCtx, file); err != nil {
+			return err
 		}
-		for _, callback := range file.postFlush {
-			callback()
-		}
-		file.postFlush = nil
 	}
 	f.files = f.files[:0]
 	return nil

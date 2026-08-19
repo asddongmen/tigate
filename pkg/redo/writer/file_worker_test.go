@@ -22,44 +22,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestFlushAllReleasesCallbacksPerCompletedFile(t *testing.T) {
+func TestFlushAllDoesNotWaitAndReleasesCallbacksInFileOrder(t *testing.T) {
 	firstFlushed := make(chan struct{})
 	secondFlushed := make(chan struct{})
-	var firstCallback atomic.Int64
-	var secondCallback atomic.Int64
+	var callbackOrder atomic.Int64
+	var firstCallbackOrder atomic.Int64
+	var secondCallbackOrder atomic.Int64
 
 	first := &fileCache{
 		flushed:   firstFlushed,
-		postFlush: []func(){func() { firstCallback.Add(1) }},
+		postFlush: []func(){func() { firstCallbackOrder.Store(callbackOrder.Add(1)) }},
 	}
 	second := &fileCache{
 		flushed:   secondFlushed,
-		postFlush: []func(){func() { secondCallback.Add(1) }},
+		postFlush: []func(){func() { secondCallbackOrder.Store(callbackOrder.Add(1)) }},
 	}
 	worker := &fileWorkerGroup{
-		files:   []*fileCache{first, second},
-		flushCh: make(chan *fileCache, 1),
+		files:      []*fileCache{first, second},
+		flushCh:    make(chan *fileCache, 2),
+		callbackCh: make(chan *fileCache, 2),
 	}
 
-	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	releaseDone := make(chan error, 1)
 	go func() {
-		done <- worker.flushAll(context.Background())
+		releaseDone <- worker.bgReleaseFileCallbacks(ctx)
 	}()
 
+	require.NoError(t, worker.flushAll(context.Background()))
+	require.Same(t, first, <-worker.flushCh)
 	require.Same(t, second, <-worker.flushCh)
-	close(firstFlushed)
-	require.Eventually(t, func() bool {
-		return firstCallback.Load() == 1
-	}, 5*time.Second, 10*time.Millisecond)
-	require.Equal(t, int64(0), secondCallback.Load())
-	select {
-	case err := <-done:
-		require.FailNow(t, "flushAll returned before every file completed", "error: %v", err)
-	default:
-	}
+	require.Empty(t, worker.files)
 
 	close(secondFlushed)
-	require.NoError(t, <-done)
-	require.Equal(t, int64(1), secondCallback.Load())
-	require.Empty(t, worker.files)
+	time.Sleep(20 * time.Millisecond)
+	require.Equal(t, int64(0), callbackOrder.Load())
+	close(firstFlushed)
+	require.Eventually(t, func() bool {
+		return callbackOrder.Load() == 2
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, int64(1), firstCallbackOrder.Load())
+	require.Equal(t, int64(2), secondCallbackOrder.Load())
+
+	cancel()
+	require.ErrorIs(t, <-releaseDone, context.Canceled)
 }
