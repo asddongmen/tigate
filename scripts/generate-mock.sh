@@ -44,3 +44,5 @@ fi
 "$MOCKGEN" -source pkg/txnutil/gc/gc_client.go -destination pkg/txnutil/gc/gc_client_mock.go -package gc
 "$MOCKGEN" -source pkg/redo/writer/writer.go -destination pkg/redo/writer/writer_mock.go -package writer
 "$MOCKGEN" -source downstreamadapter/sink/sink.go -destination downstreamadapter/sink/mock/sink_mock.go -package mock
+
+"$MOCKGEN" -source pkg/snapshot/bootstrap/interfaces.go -destination pkg/snapshot/bootstrap/interfaces_mock_test.go -package bootstrap

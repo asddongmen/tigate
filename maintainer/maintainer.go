@@ -64,10 +64,13 @@ const (
 // 4. checker controller, handled in threadpool, it runs the checkers to dynamically adjust the schedule
 // all threads are read/write information from/to the ReplicationDB
 type Maintainer struct {
-	changefeedID common.ChangeFeedID
-	info         *config.ChangeFeedInfo
-	selfNode     *node.Info
-	controller   *Controller
+	snapshotRunning bool
+	snapshotDone    bool
+	snapshotContext context.Context
+	changefeedID    common.ChangeFeedID
+	info            *config.ChangeFeedInfo
+	selfNode        *node.Info
+	controller      *Controller
 
 	pdClock            pdutil.Clock
 	eventCh            *chann.DrainableChann[*Event]
@@ -262,6 +265,7 @@ func NewMaintainer(cfID common.ChangeFeedID,
 	metrics.MaintainerGauge.WithLabelValues(keyspaceName, name).Inc()
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
+	m.snapshotContext = ctx
 
 	go m.runHandleEvents(ctx)
 	go m.calCheckpointTs(ctx)
@@ -354,6 +358,14 @@ func (m *Maintainer) HandleEvent(event *Event) bool {
 		m.onMessage(event.message)
 	case EventPeriod:
 		m.onPeriodTask()
+	case EventSnapshotDone:
+		m.snapshotRunning = false
+		if event.snapshotError != nil {
+			m.handleError(event.snapshotError)
+		} else {
+			m.snapshotDone = true
+			m.onBootstrapResponses(event.snapshotResponses)
+		}
 	}
 	return false
 }
@@ -1129,6 +1141,9 @@ func (m *Maintainer) onBootstrapResponses(responses map[node.ID]*heartbeatpb.Mai
 	// onMaintainerBootstrapResponse() run in the same event loop goroutine as onRemoveMaintainer(),
 	// hence guarding with m.removing is sufficient to avoid accessing a removed DDL span leading to panic.
 	if responses == nil || m.removing.Load() {
+		return
+	}
+	if !m.snapshotBeforeBootstrap(responses) {
 		return
 	}
 	isMySQLSinkCompatible, err := isMysqlCompatible(m.info.SinkURI)

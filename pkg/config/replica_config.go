@@ -27,6 +27,7 @@ import (
 	cerror "github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/integrity"
 	"github.com/pingcap/ticdc/pkg/redo"
+	"github.com/pingcap/ticdc/pkg/snapshot/protocol"
 	"github.com/pingcap/ticdc/pkg/util"
 	"go.uber.org/zap"
 )
@@ -149,11 +150,12 @@ func (d *Duration) UnmarshalText(text []byte) error {
 type ReplicaConfig replicaConfig
 
 type replicaConfig struct {
-	PerformanceMode  *string `toml:"performance-mode" json:"performance-mode,omitempty"`
-	MemoryQuota      *uint64 `toml:"memory-quota" json:"memory-quota,omitempty"`
-	CaseSensitive    *bool   `toml:"case-sensitive" json:"case-sensitive,omitempty"`
-	ForceReplicate   *bool   `toml:"force-replicate" json:"force-replicate,omitempty"`
-	CheckGCSafePoint *bool   `toml:"check-gc-safe-point" json:"check-gc-safe-point,omitempty"`
+	Snapshot         *protocol.Config `toml:"snapshot" json:"snapshot,omitempty"`
+	PerformanceMode  *string          `toml:"performance-mode" json:"performance-mode,omitempty"`
+	MemoryQuota      *uint64          `toml:"memory-quota" json:"memory-quota,omitempty"`
+	CaseSensitive    *bool            `toml:"case-sensitive" json:"case-sensitive,omitempty"`
+	ForceReplicate   *bool            `toml:"force-replicate" json:"force-replicate,omitempty"`
+	CheckGCSafePoint *bool            `toml:"check-gc-safe-point" json:"check-gc-safe-point,omitempty"`
 	// EnableRedoIOCheck controls whether consistency storage validation should
 	// perform an I/O accessibility check. This field is internal only.
 	EnableRedoIOCheck *bool `toml:"-" json:"-"`
